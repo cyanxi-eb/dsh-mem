@@ -1,0 +1,13 @@
+# dsh-mem — 一行插入自己。config 与 index.mjs 的 DEFAULTS 同源，改一边要同步另一边。
+- insert:
+    - id: dsh-mem
+      name: 'dsh-mem'
+      config:
+        # 库目录；留空 = $DSH_HOME/mem（既有库路径不变）
+        storeDir: ''
+        # 入库时跳过的会话 / 文件路径 glob，例如 ['*scratch*', '*/private/*']
+        excludePaths: []
+        # 入库前替换成 [redacted] 的正则字符串，例如 ['sk-[A-Za-z0-9]{20,}', 'ghp_[A-Za-z0-9]{36}']
+        redact: []
+        # 首次工具调用时按当前工作区后台 ingest 一次
+        autoIngest: false

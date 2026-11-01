@@ -1,0 +1,6 @@
+# 统一 LF：bin 的 shebang 在 Unix 上一旦变 CRLF 就跑不起来
+* text=auto
+*.mjs text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf

@@ -1,0 +1,52 @@
+{
+  "name": "dsh-mem",
+  "version": "0.1.0",
+  "description": "零依赖本地记忆层：回指针 + 原文切片、NDJSON 迁移、隐私闸（DSH 插件 + 独立 CLI，只用 node:* 与 node:sqlite）",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./core": "./lib/core.mjs",
+    "./portable": "./lib/portable.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-mem": "./bin/dsh-mem.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "skill/",
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "selftest": "node bin/dsh-mem.mjs selftest",
+    "check": "node --check index.mjs && node --check lib/core.mjs && node --check lib/portable.mjs && node --check bin/dsh-mem.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "memory",
+    "fts5",
+    "sqlite",
+    "local-first",
+    "ndjson"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyanxi-eb/dsh-mem.git"
+  },
+  "license": "MIT"
+}
