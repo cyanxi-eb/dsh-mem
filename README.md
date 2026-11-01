@@ -18,18 +18,33 @@
 
 ## 安装
 
+### 作为 DSH 插件（推荐，GitHub 直装）
+
+```
+dsh plugin --profile <profile> add github:cyanxi-eb/dsh-mem
+```
+
+实测（DSH 0.2.1-rc.5）：`EXIT=0`，5.7s，只下载 1 个 tarball，装到
+`<DSH_HOME>/profiles/<profile>/node_modules/dsh-mem`，package.json 的
+`dsh.profile.bundles` 自动多出 `dsh-mem`，`--dump-config` 里出现 insert 条目与四个配置默认值。
+**装完需重启 DSH**，4 个工具才会进工具表。
+
+> ⚠️ 前置：`dsh plugin` 会 spawn **裸 `pnpm`**。若 `pnpm` 不在 PATH 上，裸命令行会报
+> `'pnpm' is not recognized`。两条出路：把 pnpm 放进 PATH，或改用 GUI 的插件管理器
+> （宿主自己会传内置 pnpm 路径）。同理 `dsh` 本身也常不在 PATH，可用
+> `node "<DSH>/resources/app/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" plugin ...`。
+
+### 作为独立 CLI（不依赖 DSH）
+
 ```bash
-npm i -g dsh-mem          # 装 CLI（可选）
-dsh-mem stats             # 有 bin 之后
+node bin/dsh-mem.mjs stats      # 仓库内直接用，零依赖
+npm i -g dsh-mem                # 发布到 npm 之后可用（当前未发布）
 ```
 
-作为 DSH 插件装进某个 profile：
+CLI 与插件共用 `lib/core.mjs` 这一份实现，行为一致。
 
-```
-plugin_manager(action="install_bundle", target="dsh-mem")
-```
+### 配置项
 
-手工装也行：把本仓库 / npm 包放进 profile 的 `node_modules`，再让 profile 的 bundle 引入它 ——
 `package.json` 已声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，patch 内容是：
 
 ```yaml
@@ -38,6 +53,11 @@ plugin_manager(action="install_bundle", target="dsh-mem")
       name: 'dsh-mem'
       config: { storeDir: '', excludePaths: [], redact: [], autoIngest: false }
 ```
+
+- `storeDir` — 库目录，空 = `<DSH_HOME>/mem`；换机器/换盘改这里
+- `excludePaths` — ingest 时跳过的路径前缀
+- `redact` — 入库前替换的正则数组（见下节）
+- `autoIngest` — 默认 `false`：**不自动索引**，由你显式触发
 
 插件只 `inject: ['tools']`；宿主没就绪的其它服务一概不声明（少一项 inject，就少一种"永远加载中"）。
 
