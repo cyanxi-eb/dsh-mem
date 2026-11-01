@@ -25,8 +25,10 @@ test('插件元信息：name / inject / 默认导出都是 apply', () => {
   assert.deepEqual(inject, ['tools']);
   assert.equal(typeof apply, 'function');
   assert.equal(applyDefault, apply, '默认导出必须是 apply（`import apply from "dsh-mem"` 直接用）');
-  assert.deepEqual(DEFAULTS, { storeDir: '', excludePaths: [], redact: [], autoIngest: false });
+  assert.deepEqual(DEFAULTS, { workspace: '', storeDir: '', excludePaths: [], redact: [], autoIngest: false });
   assert.equal(normalizeConfig({}).storeDir, path.join(core.homeDir(), 'mem'), 'storeDir 缺省 = $DSH_HOME/mem');
+  assert.equal(normalizeConfig({}).workspace, '', 'workspace 缺省 = 空（走优先级链）');
+  assert.equal(normalizeConfig({ workspace: 'D:\\dsh-sp1' }).workspace, path.resolve('D:\\dsh-sp1'));
   assert.equal(normalizeConfig({ storeDir: 'D:\\x' }).storeDir, path.resolve('D:\\x'));
 });
 
@@ -121,6 +123,58 @@ test('配置透传：excludePaths / redact / autoIngest 进到工具里', async 
     const badCfg = fakeCtx();
     await apply(badCfg.ctx, { storeDir: path.join(home, 'mem'), redact: ['('] });
     assert.equal(badCfg.registered.length, 4, '坏正则只告警，不阻断注册');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+  }
+});
+
+test('工作区解析只有一份：钉死 workspace 后插件与 CLI 同库（真实值 D:\\dsh-sp1 → 53fe3fff-dsh-sp1.db）', async () => {
+  // 同一个 core.resolveWorkspace：CLI 传 workspace，插件传 workspace + 宿主候选，结果必须一致
+  const cliWs = core.resolveWorkspace({ workspace: 'D:\\dsh-sp1' });
+  const pluginWs = core.resolveWorkspace({ workspace: 'D:\\dsh-sp1', host: ['D:\\other'], cwd: 'C:\\elsewhere' });
+  assert.equal(cliWs, pluginWs, 'CLI 与插件必须解析出同一工作区');
+  assert.equal(path.basename(core.dbPathOf(core.homeDir(), pluginWs)), '53fe3fff-dsh-sp1.db', 'slug 必须与真实库名一致');
+
+  // 优先级链：配置 > 宿主会话 cwd > process.cwd() > profile 目录
+  assert.equal(core.resolveWorkspace({ workspace: 'D:\\w-pin', host: ['D:\\w-host'], cwd: 'D:\\w-cwd' }), 'D:\\w-pin');
+  assert.equal(core.resolveWorkspace({ workspace: '', host: ['D:\\w-host'], cwd: 'D:\\w-cwd' }), 'D:\\w-host');
+  assert.equal(core.resolveWorkspace({ workspace: '', host: [], cwd: 'D:\\w-cwd' }), 'D:\\w-cwd');
+  assert.equal(
+    core.resolveWorkspace({ workspace: '', host: [], cwd: '', env: { DSH_PROFILE_DIR: 'C:\\p\\desktop' } }),
+    'C:\\p\\desktop',
+    '全空才回退 profile 目录（与旧 process.cwd() 落在 profile 时的库名 99df5c98-desktop.db 等价）');
+  assert.equal(path.basename(core.dbPathOf(core.homeDir(), 'C:\\Users\\test\\.dsh\\profiles\\desktop')), '99df5c98-desktop.db',
+    '兜底到 profile 目录时仍命中旧库名（不制造第三个库）');
+
+  // 插件 execute 真的打开钉死的那个库（不与 process.cwd() 的库混）
+  const home = tmpHome();
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const storeDir = path.join(home, 'mem');
+    const pinned = core.dbPathOf(home, 'D:\\dsh-sp1', storeDir);
+    const db = core.openDb(pinned, { mustExist: false });
+    core.insertRows(db, [{ session: 'sess-pin', seq: 1, role: 'user', ts: 1, text: '钉死工作区后四个工具都必须读这一个库', kind: 'user' }]);
+    db.close();
+
+    const { ctx, registered } = fakeCtx();
+    ctx.get = () => undefined;                       // 宿主没有 workingDirectory 服务也不能炸
+    await apply(ctx, { workspace: 'D:\\dsh-sp1', storeDir });
+    const byName = Object.fromEntries(registered.map((t) => [t.name, t]));
+    const st = await byName.mem_stats.execute({}, { agent: { session: { header: { cwd: 'D:\\other' } } } });
+    assert.equal(st.db, pinned, 'stats.db 必须是 53fe3fff-dsh-sp1.db');
+    assert.equal(path.basename(st.db), '53fe3fff-dsh-sp1.db');
+    assert.equal(st.turns, 1);
+
+    // 未钉死时用宿主会话 cwd（而不是 process.cwd()）
+    const wsHost = path.join(home, 'ws-host');
+    fs.mkdirSync(wsHost, { recursive: true });
+    const hostDb = core.dbPathOf(home, wsHost, storeDir);
+    core.openDb(hostDb, { mustExist: false }).close();
+    const c2 = fakeCtx();
+    await apply(c2.ctx, { storeDir });
+    const st2 = await c2.registered.find((t) => t.name === 'mem_stats').execute({}, { agent: { session: { header: { cwd: wsHost } } } });
+    assert.equal(st2.db, hostDb, '无配置时必须取宿主会话 cwd');
   } finally {
     if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
   }

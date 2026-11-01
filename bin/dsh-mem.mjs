@@ -51,7 +51,8 @@ export function parseArgs(argv) {
 /** 配置优先级：CLI 旗标 > 环境变量 > 缺省。宿主插件那条路径用的是 cordis config。 */
 function contextOf(opts) {
   const home = core.homeDir(opts);
-  const ws = core.normWorkspace(opts.workspace || process.cwd());
+  // 与插件同一个函数：--workspace > （宿主无会话，跳过）> process.cwd() > profile 目录
+  const ws = core.resolveWorkspace({ workspace: opts.workspace, home });
   const storeDir = opts['store-dir'] || process.env.DSH_MEM_DIR || '';
   return {
     home, ws, storeDir,

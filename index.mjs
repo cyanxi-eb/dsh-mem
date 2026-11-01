@@ -7,6 +7,7 @@
  * （参数规格只用到 string/integer/boolean 三种，编译规则与宿主 parameterSchemaSpecToJsonSchema 一致）。
  *
  * 配置（cordis.patch.yml 的 config 与本文件 defaults 同源）：
+ *   workspace    钉死的工作区绝对路径，缺省 ''（空 = 按 core.resolveWorkspace 的优先级链解析）
  *   storeDir     库目录，缺省 $DSH_HOME/mem（旧库路径不变）
  *   excludePaths 入库时跳过的会话/文件路径 glob 数组，缺省 []
  *   redact       入库前替换的正则字符串数组，缺省 []（命中替换为 [redacted]）
@@ -22,6 +23,7 @@ export const inject = ['tools'];
 
 /** 与 cordis.patch.yml 的 config 同源；改这里要同步改那里。 */
 export const DEFAULTS = {
+  workspace: '',
   storeDir: '',
   excludePaths: [],
   redact: [],
@@ -82,6 +84,7 @@ export function loadDefineTool() {
 export function normalizeConfig(config = {}) {
   const home = core.homeDir();
   return {
+    workspace: config.workspace ? path.resolve(config.workspace) : '',
     storeDir: config.storeDir ? path.resolve(config.storeDir) : path.join(home, 'mem'),
     excludePaths: Array.isArray(config.excludePaths) ? config.excludePaths : [],
     redact: Array.isArray(config.redact) ? config.redact : [],
@@ -89,17 +92,26 @@ export function normalizeConfig(config = {}) {
   };
 }
 
-function resolveWorkspace(ctx) {
-  const candidates = [];
-  try { candidates.push(ctx?.agent?.session?.header?.cwd); } catch { /* cordis 代理未注入时点属性会抛 */ }
-  try { candidates.push(ctx?.session?.header?.cwd); } catch { /* ignore */ }
-  const hit = candidates.find((c) => typeof c === 'string' && c.trim());
-  return core.normWorkspace(hit || process.cwd());
+/**
+ * 宿主能提供的会话工作目录候选，按真实字段取；取不到就返回空数组（交给下一级），不猜。
+ * - exec.agent.session.header.cwd：Session 的原始 cwd（宿主 dsh-working-directory 的 init 源）
+ * - ctx.workingDirectory.get(session)：宿主已提交的当前目录（同步、无 IO、不改状态）
+ */
+function hostWorkspaces(ctx, exec) {
+  const out = [];
+  const session = (() => { try { return exec?.agent?.session; } catch { return undefined; } })();
+  if (!session) return out;
+  try { out.push(session.header?.cwd); } catch { /* ignore */ }
+  try {
+    const svc = ctx?.get?.('workingDirectory') ?? ctx?.workingDirectory;
+    if (session && typeof svc?.get === 'function') out.push(svc.get(session));
+  } catch { /* 服务未注入 → 跳过 */ }
+  return out;
 }
 
-function libContext(ctx, cfg) {
+function libContext(ctx, cfg, exec) {
   const home = core.homeDir();
-  const ws = resolveWorkspace(ctx);
+  const ws = core.resolveWorkspace({ workspace: cfg.workspace, host: hostWorkspaces(ctx, exec), home });
   return { home, ws, dbp: core.dbPathOf(home, ws, cfg.storeDir), cfg };
 }
 
@@ -145,9 +157,9 @@ export function toolSpecs(cfg, ctx) {
         k: { type: 'integer', description: 'Max results, default 8.' },
       },
       output: OUTPUT,
-      async execute(args) {
+      async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg);
+          const lc = libContext(ctx, cfg, exec);
           kickAutoIngest(lc);
           const db = core.openDb(lc.dbp);
           try { return core.search(db, String(args.query ?? ''), Number(args.k ?? 8)); }
@@ -166,9 +178,9 @@ export function toolSpecs(cfg, ctx) {
         context: { type: 'integer', description: 'Turns before and after the anchor, default 2.' },
       },
       output: OUTPUT,
-      async execute(args) {
+      async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg);
+          const lc = libContext(ctx, cfg, exec);
           const db = core.openDb(lc.dbp);
           try {
             const r = core.openPointer(db, String(args.pointer ?? ''), Number(args.context ?? 2));
@@ -190,9 +202,9 @@ export function toolSpecs(cfg, ctx) {
         dryRun: { type: 'boolean', description: 'Count only, write nothing.' },
       },
       output: OUTPUT,
-      async execute(args) {
+      async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg);
+          const lc = libContext(ctx, cfg, exec);
           if (args.file) {
             return portable.ingestFile(lc.dbp, String(args.file), {
               source: args.source ? String(args.source) : '', dryRun: args.dryRun === true,
@@ -208,9 +220,9 @@ export function toolSpecs(cfg, ctx) {
       description: 'Index health for this workspace: db path/size, session count, turn counts, fact counts, ingest watermark.',
       parameters: {},
       output: OUTPUT,
-      async execute() {
+      async execute(_args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg);
+          const lc = libContext(ctx, cfg, exec);
           const db = core.openDb(lc.dbp);
           try { return core.stats(db, lc.dbp); } finally { db.close(); }
         });

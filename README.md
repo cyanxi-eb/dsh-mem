@@ -51,9 +51,10 @@ CLI 与插件共用 `lib/core.mjs` 这一份实现，行为一致。
 - insert:
     - id: dsh-mem
       name: 'dsh-mem'
-      config: { storeDir: '', excludePaths: [], redact: [], autoIngest: false }
+      config: { workspace: '', storeDir: '', excludePaths: [], redact: [], autoIngest: false }
 ```
 
+- `workspace` — 钉死的工作区绝对路径（例如 `'D:\dsh-sp1'`）；空 = 按下面的优先级链自动解析。**解析只有 `core.resolveWorkspace` 一份实现，CLI 与插件共用**：`workspace` 配置 > 宿主会话 `cwd`（`exec.agent.session.header.cwd` / `workingDirectory.get(session)`，取不到就跳过）> `process.cwd()` > profile 目录（`DSH_PROFILE_DIR` / `<DSH_HOME>/profiles/<DSH_PROFILE>`）
 - `storeDir` — 库目录，空 = `<DSH_HOME>/mem`；换机器/换盘改这里
 - `excludePaths` — ingest 时跳过的路径前缀
 - `redact` — 入库前替换的正则数组（见下节）
@@ -89,7 +90,7 @@ dsh-mem selftest                                     # 14 项自检（临时库�
 | `mem_ingest` | `file?`、`source?`、`dryRun?` | ingest 统计（无 `file` = 重扫本工作区会话） |
 | `mem_stats` | 无 | 库路径/大小、会话数、轮次、fact 计数、水位 |
 
-工作区取自宿主会话 `cwd`（取不到才退回 `process.cwd()`）；一工作区一库，按 `<hash8>-<目录名>.db` 分片。
+工作区由 `core.resolveWorkspace` 按固定优先级解析（配置 `workspace` → 宿主会话 `cwd` → `process.cwd()` → profile 目录），CLI 走同一个函数；一工作区一库，按 `<hash8>-<目录名>.db` 分片。
 
 ## 隐私闸（入库前生效，不是事后过滤）
 

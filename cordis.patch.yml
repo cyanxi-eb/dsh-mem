@@ -3,6 +3,8 @@
     - id: dsh-mem
       name: 'dsh-mem'
       config:
+        # 钉死的工作区绝对路径；留空 = 按优先级链解析（会话 cwd → process.cwd() → profile 目录）
+        workspace: ''
         # 库目录；留空 = $DSH_HOME/mem（既有库路径不变）
         storeDir: ''
         # 入库时跳过的会话 / 文件路径 glob，例如 ['*scratch*', '*/private/*']
