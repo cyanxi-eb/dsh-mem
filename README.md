@@ -39,7 +39,7 @@ dsh plugin --profile <profile> add github:cyanxi-eb/dsh-mem
 实测（DSH 0.2.1-rc.5）：`EXIT=0`，5.7s，只下载 1 个 tarball，装到
 `<DSH_HOME>/profiles/<profile>/node_modules/dsh-mem`，package.json 的
 `dsh.profile.bundles` 自动多出 `dsh-mem`，`--dump-config` 里出现 insert 条目与四个配置默认值。
-**装完需重启 DSH**，5 个工具才会进工具表，面板挂到「设置 → 记忆库（dsh-mem）」（见下节）。
+**装完需重启 DSH**，5 个工具才会进工具表，面板挂到会话顶部页签「记忆库」（见下节）。
 
 > ⚠️ 前置：`dsh plugin` 会 spawn **裸 `pnpm`**。若 `pnpm` 不在 PATH 上，裸命令行会报
 > `'pnpm' is not recognized`。两条出路：把 pnpm 放进 PATH，或改用 GUI 的插件管理器
@@ -103,9 +103,11 @@ CLI 与插件共用 `lib/core.mjs` 这一份实现，行为一致。
 默认值**只有一份**：`index.mjs` 的 `DEFAULTS`（`cordis.patch.yml` 与它逐键相等，`test/routes.test.mjs` ⑥ 看着）。
 `lib/settings-schema.js` 只留值域（`BOUNDS`）与消毒，不再持有默认值。
 
-### 设置面板（0.2）
+### 记忆库面板（0.2）
 
-`dsh.client` 让 web 端加载 `lib/client.js`，面板落在「设置 → 记忆库（dsh-mem）」。
+`dsh.client` 让 web 端加载 `lib/client.js`，面板落在**会话顶部那排页签**：「对话 | 轨迹 | 记忆库」。
+落点是 `conversation.view`（list 插槽，`id:"dsh-mem"`, `order:20`），与内建「对话(0) / 轨迹(10)」同一排；
+面板默认收起（零请求），点「展开」才拉 `/panel/state`。
 它读写的 5 条路由由宿主半注册在 GUI 同一个 web 服务上（`docs/PANEL-CONTRACT.md` 是契约）：
 
 ```
@@ -116,7 +118,8 @@ GET  /dsh-mem/panel/models/download?jobId=…  轮询进度
 POST /dsh-mem/panel/reindex             增量 ingest + episode pass
 ```
 
-插件 `inject: ['tools', 'webServer']`：宿主没有 webServer 服务就不挂面板（5 个工具照旧）。
+插件静态 `inject: ['tools']`；`webServer` 用 `ctx.inject(["webServer"], host => host.effect(...))` 动态挂
+（静态列进去会等一个后挂服务，路由就一条也挂不上）。
 
 ## 命令（CLI）
 

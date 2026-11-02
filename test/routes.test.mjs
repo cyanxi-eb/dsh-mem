@@ -299,20 +299,70 @@ test('⑥ 默认值只有一份：/panel/state 的 config 与 cordis.patch.yml �
   console.log(`[routes] defaults: ${PANEL_KEYS.length} 键三方一致（state = DEFAULTS = cordis.patch.yml）`);
 });
 
-// ── ⑦ apply() 真接线 ────────────────────────────────────────────────────
-test('⑦ apply() 注册 4 条 exact 路径（5 个 method），dispose 后全部注销', async () => {
+// ── ⑦ apply() 真接线（动态注入 webServer）────────────────────────────────
+/**
+ * 假 ctx：形状逐字对齐 cordis 的 `ctx.inject(deps, cb) → fiber` 与 `host.effect(fn, label) → disposer`。
+ * `defer` = 先不触发回调（模拟 webServer 还没挂上），由用例手动 fire()。
+ */
+function fakeCtx(web, { defer = false } = {}) {
+  const registered = [];
+  const labels = [];
+  const effects = [];
+  const state = { injected: [], fired: false, callback: null };
+  const host = {
+    webServer: web,
+    effect(fn, label) {
+      labels.push(label);
+      const cleanup = fn();
+      const off = () => { try { cleanup?.(); } catch { /* ignore */ } };
+      effects.push(off);
+      return off;
+    },
+  };
+  const ctx = {
+    tools: { register(def) { registered.push(def); return () => {}; } },
+    inject(names, cb) {
+      state.injected.push(names);
+      state.callback = cb;
+      if (!defer) { state.fired = true; cb(host); }
+      return { fiber: true, names };
+    },
+  };
+  return {
+    ctx, registered, labels, state, host,
+    fire() { state.fired = true; state.callback(host); },
+    /** 模拟 cordis 卸载插件：跑掉该 fiber 上所有 effect 的 cleanup。 */
+    disposeEffects() { while (effects.length) effects.pop()(); },
+  };
+}
+
+test('⑦ apply() 静态 inject 只有 tools；webServer 走动态注入，注册 4 条 exact 路径（5 个 method）', async () => {
   const home = tmpHome('dsh-mem-apply-');
   const prev = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
   try {
     const web = fakeWebServer();
-    const registered = [];
-    const ctx = {
-      tools: { register(def) { registered.push(def); return () => {}; } },
-      webServer: web,
-    };
-    const dispose = await apply(ctx, { storeDir: path.join(home, 'mem') });
-    assert.equal(registered.length, 5, '5 个工具照旧注册');
+    const f = fakeCtx(web);
+    let dispose;
+    const { logs } = await (async () => {
+      const bag = { logs: [] };
+      const prevLog = console.log;
+      console.log = (...a) => { bag.logs.push(a.map(String).join(' ')); };
+      try { dispose = await apply(f.ctx, { storeDir: path.join(home, 'mem') }); }
+      finally { console.log = prevLog; }
+      return bag;
+    })();
+
+    // 静态 inject 只留 tools：webServer 列进去会让 apply 等一个后挂的服务
+    const mod = await import('../index.mjs');
+    assert.deepEqual(mod.inject, ['tools'], '静态 inject 必须是 [tools]');
+    assert.deepEqual(f.state.injected, [['webServer']], '必须用 ctx.inject(["webServer"], …) 动态拿服务');
+    assert.equal(f.state.fired, true, '同步就绪时必须真的触发回调');
+    assert.deepEqual(f.labels, ['dsh-mem: panel routes']);
+
+    assert.equal(f.registered.length, 5, '5 个工具照旧注册');
+    assert.ok(logs.some((l) => l.includes('[dsh-mem] panel routes registered: /dsh-mem/panel/*')),
+      `注册成功必须打一行 console.log（实际: ${JSON.stringify(logs)}）`);
     assert.deepEqual(web.routes.map((r) => r.path).sort(), [
       '/dsh-mem/panel/models/download', '/dsh-mem/panel/reindex',
       '/dsh-mem/panel/settings', '/dsh-mem/panel/state',
@@ -326,8 +376,64 @@ test('⑦ apply() 注册 4 条 exact 路径（5 个 method），dispose 后全�
     assert.equal(r.json.episodes, 0);
 
     dispose();
+    assert.equal(web.routes.length, 4, 'apply 的 disposer 只管工具，路由归 inject fiber 的 effect');
+
+    f.disposeEffects();                                  // = cordis 卸载插件时跑 effect cleanup
     assert.equal(web.routes.length, 0, '卸载必须注销全部路由（端口上不留残废路由）');
-    console.log('[routes] apply(): 4 路径注册 + dispose 全清');
+    console.log('[routes] apply(): ctx.inject → host.effect → 4 路径 + effect cleanup 全清');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+  }
+});
+
+test('⑧ 路由只在 ctx.inject 回调触发后才注册（webServer 晚到也接得上）', async () => {
+  const home = tmpHome('dsh-mem-apply-defer-');
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const web = fakeWebServer();
+    const f = fakeCtx(web, { defer: true });
+    const dispose = await apply(f.ctx, { storeDir: path.join(home, 'mem') });
+
+    assert.equal(f.registered.length, 5, '工具不等 webServer，先注册');
+    assert.equal(f.state.fired, false);
+    assert.equal(web.routes.length, 0, '回调没触发就一条路由都不许有');
+
+    f.fire();
+    assert.equal(web.routes.length, 4, '回调触发后 4 条路径就位');
+    const r = await call(web, 'GET', '/dsh-mem/panel/state');
+    assert.equal(r.status, 200);
+    dispose();
+    f.disposeEffects();
+    assert.equal(web.routes.length, 0);
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+  }
+});
+
+test('⑨ host.webServer.register 抛错（路径重复）时不炸 apply，且把原文打出来', async () => {
+  const home = tmpHome('dsh-mem-apply-throw-');
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const web = fakeWebServer();
+    web.register = () => { throw new Error('route already registered: /dsh-mem/panel/state'); };
+    const f = fakeCtx(web);
+    let dispose;
+    const { errs } = await (async () => {
+      const prevErr = console.error;
+      const bag = { errs: [] };
+      console.error = (...a) => { bag.errs.push(a.map(String).join(' ')); };
+      try { dispose = await apply(f.ctx, { storeDir: path.join(home, 'mem') }); }
+      finally { console.error = prevErr; }
+      return bag;
+    })();
+
+    assert.equal(f.registered.length, 5, '路由注册失败不影响 5 个工具');
+    assert.ok(errs.some((e) => e.includes('host.webServer.register failed')), '必须打 error');
+    assert.ok(errs.some((e) => e.includes('route already registered')), '必须把抛错原文带出来');
+    assert.doesNotThrow(() => dispose());
+    f.disposeEffects();
   } finally {
     if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
   }

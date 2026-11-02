@@ -6,8 +6,9 @@
  * 用一个 70 行的迷你 renderer 真的把 React 元素树展开，数控件、读文案。
  *
  * 断言四条：
- *   ① load 的 id 逐字等于包名 dsh-mem（id ≠ 包名会让整个 web boot 不激活）；
- *   ② 至少渲染出 8 个设置项控件（input/select）；
+ *   ① load 的 id 逐字等于包名 dsh-mem（id ≠ 包名会让整个 web boot 不激活），
+ *      且注册落点是**真实存在的插槽** `conversation.view`（会话页签，见 client.js 文件头证据）；
+ *   ② 收起态零请求、展开只拉 /state 一条，然后至少渲染出 8 个设置项控件；
  *   ③ 取数失败时不抛异常，降级成「读取失败：<服务端原文>」；
  *   ④ 面板字段表与 lib/settings-schema.js 的键集合 / 默认值逐项一致（防漂）。
  */
@@ -165,44 +166,80 @@ async function mountPanel({ fetchImpl }) {
     const registrations = [];
     const ctx = {
       slots: {
-        inject(slot, cb) { assert.equal(slot, "settings.section"); return cb(); },
+        // 真实插槽名：conversation.view（会话页签 list 插槽），不是 settings.section
+        inject(slot, cb) { assert.equal(slot, "conversation.view"); return cb(); },
         register(options, factory) { registrations.push({ options, factory }); return () => {}; },
       },
     };
     mod.apply(ctx);
-    assert.equal(registrations.length, 1, "apply 必须向 settings.section 注册恰好一个面板");
+    assert.equal(registrations.length, 1, "apply 必须向 conversation.view 注册恰好一个页签");
     const tree = await runtime.render(registrations[0].factory, null);
-    return { loader, mod, registrations, tree };
+    // 交互后要重渲染：把 fetch 再装一次（mountPanel 退出时已经还回去了）
+    const rerender = async () => {
+      const prevFetch2 = globalThis.fetch;
+      globalThis.fetch = fetchImpl;
+      try { return await runtime.render(registrations[0].factory, null); }
+      finally { globalThis.fetch = prevFetch2; }
+    };
+    return { loader, mod, registrations, tree, rerender };
   } finally {
     globalThis.window = prevWindow;
     globalThis.fetch = prevFetch;
   }
 }
 
-test("① 注册 id 是包名 dsh-mem，且落点是 settings.section", async () => {
+/** 在渲染树里找文案匹配的 <button>。 */
+function findButton(tree, text) {
+  return collect(tree, (n) => n.type === "button" && textOf(n).includes(text))[0];
+}
+
+/** 展开面板（点「展开」）并重渲染，返回展开后的树。 */
+async function expandPanel(mounted) {
+  const btn = findButton(mounted.tree, "展开");
+  assert.ok(btn && typeof btn.props.onClick === "function", "收起态必须有一个「展开」按钮");
+  btn.props.onClick();
+  return mounted.rerender();
+}
+
+test("① 注册 id 是包名 dsh-mem，落点是真实插槽 conversation.view（会话页签）", async () => {
   const { loader, mod, registrations } = await mountPanel({ fetchImpl: async () => jsonRes(200, GOOD_STATE) });
   assert.equal(loader.id, "dsh-mem");
   assert.equal(mod.name, "dsh-mem");
   assert.deepEqual(mod.inject, ["slots"]);
   assert.equal(typeof mod.apply, "function");
   assert.equal(mod.default, mod.apply);
-  assert.equal(registrations[0].options.name, "settings.section");
+  // 宿主出处：dsh-client-ui-chat/lib/client.js:13256（id:"chat"）与
+  // dsh-client-ui-trajectory/lib/client.js:8205（id:"trajectory"）都注册在这个插槽上
+  assert.equal(registrations[0].options.name, "conversation.view");
   assert.equal(registrations[0].options.id, "dsh-mem");
-  assert.equal(typeof registrations[0].options.label(), "string");
+  assert.equal(registrations[0].options.order, 20, "排在 chat(0) / trajectory(10) 之后");
+  assert.equal(typeof registrations[0].options.label, "function");
+  assert.equal(registrations[0].options.label(), "记忆库");
+  assert.equal(mod.panelMeta.slot, "conversation.view");
   console.log(`[smoke] id=${loader.id} slot=${registrations[0].options.name} label=${registrations[0].options.label()}`);
 });
 
-test("② 至少渲染 8 个设置项控件，且键集合与 settings-schema 一致", async () => {
-  const { mod, tree } = await mountPanel({ fetchImpl: async () => jsonRes(200, GOOD_STATE) });
+test("② 收起时不发请求；展开后渲染 9 个设置项控件，键集合与 settings-schema 一致", async () => {
+  const calls = [];
+  const mounted = await mountPanel({
+    fetchImpl: async (url) => { calls.push(String(url)); return jsonRes(200, GOOD_STATE); },
+  });
+  assert.deepEqual(calls, [], "收起态一次请求都不许发（一进来不轰接口）");
+  const collapsed = findButton(mounted.tree, "展开");
+  assert.ok(collapsed, "收起态必须有「展开」入口");
+
+  const tree = await expandPanel(mounted);
+  assert.deepEqual(calls, ["/dsh-mem/panel/state"], "展开只拉 /state 一条，不并发轰 5 个接口");
+
   const controls = collect(tree, (n) => n.type === "input" || n.type === "select");
   const checkbox = controls.filter((n) => n.props && n.props.type === "checkbox").length;
   const selects = controls.filter((n) => n.type === "select").length;
   console.log(`[smoke] controls=${controls.length} (checkbox=${checkbox}, select=${selects})`);
   assert.ok(controls.length >= 8, `设置项控件至少 8 个，实际 ${controls.length}`);
 
-  const panelKeys = mod.panelMeta.fields.map((f) => f.key);
+  const panelKeys = mounted.mod.panelMeta.fields.map((f) => f.key);
   assert.deepEqual(panelKeys, PANEL_KEYS, "面板字段键集合/顺序必须与 lib/settings-schema.js 一致");
-  assert.deepEqual(mod.panelMeta.defaults, { ...PANEL_DEFAULTS }, "面板默认值必须与 settings-schema 一致");
+  assert.deepEqual(mounted.mod.panelMeta.defaults, { ...PANEL_DEFAULTS }, "面板默认值必须与 settings-schema 一致");
 
   const text = textOf(tree);
   assert.ok(text.includes("266"), "状态卡应渲染 turn 数");
@@ -210,9 +247,10 @@ test("② 至少渲染 8 个设置项控件，且键集合与 settings-schema �
 });
 
 test("③ 取数失败不抛异常，降级成错误文案（原文照显）", async () => {
-  const { tree } = await mountPanel({
+  const mounted = await mountPanel({
     fetchImpl: async () => { throw new Error("宿主不可达（ECONNREFUSED 127.0.0.1:0）"); },
   });
+  const tree = await expandPanel(mounted);
   const text = textOf(tree);
   console.log(`[smoke] error-text="${text.match(/读取失败：[^ ]*/)?.[0] || "(missing)"}"`);
   assert.ok(text.includes("读取失败"), "失败时必须显示「读取失败」文案而不是空白");

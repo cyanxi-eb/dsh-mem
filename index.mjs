@@ -2,7 +2,9 @@
  * dsh-mem — 宿主半（Cordis 插件入口）。
  *
  * 只注册 5 个工具，全部转调 lib/core.mjs 与 lib/portable.mjs；这里没有第二份实现。
- * 契约照已装插件抄：`inject = ['tools', 'webServer']` + `ctx.tools.register(defineTool({...}))`，
+ * 契约照已装插件抄：`inject = ['tools']` + `ctx.tools.register(defineTool({...}))`，
+ * 面板的 4 条 HTTP 路径（5 个 method）走 `ctx.inject(["webServer"], host => host.effect(...))`
+ * 动态挂载（静态 inject 里**不放** webServer，否则 apply 会等一个后挂的服务，路由永远挂不上）。
  * defineTool 优先从宿主的 @deepseek-ai/dsh-tools 解析，解析不到时用本文件的等价编译兜底
  * （参数规格只用到 string/integer/boolean 三种，编译规则与宿主 parameterSchemaSpecToJsonSchema 一致）。
  *
@@ -30,8 +32,12 @@ import { RERANK_MODES } from './lib/settings-schema.js';
 import { readPanelConfig, registerPanelRoutes } from './lib/panel-routes.mjs';
 
 export const name = 'dsh-mem';
-// webServer 让面板的 5 条路由挂到 GUI 同一个 web 服务上；宿主没这个服务就不挂面板（工具照旧）。
-export const inject = ['tools', 'webServer'];
+/**
+ * 静态依赖只留 tools。webServer 走**动态注入**（与已装插件 dsh-purge 同一模式）：
+ * 静态列进去会让整个 apply 卡在等 webServer 上，而宿主里 webServer 是后挂的，
+ * 结果工具能注册、路由却一条也没挂上（`/dsh-mem/panel/state` 直接 404）。
+ */
+export const inject = ['tools'];
 
 /** 与 cordis.patch.yml 的 config 同源；改这里要同步改那里（键名逐字绑定，面板按这些 key 写）。 */
 export const DEFAULTS = {
@@ -392,28 +398,43 @@ export async function apply(ctx, config) {
 
   const disposers = tools.map((tool) => register(tool));
 
-  // 面板路由：宿主没有 webServer 服务就跳过（工具照常，面板降级成"读取失败"文案）
-  let disposeRoutes = null;
+  // ───────────────────────── 面板路由（动态注入 webServer）─────────────────────────
+  // 抄 dsh-purge/lib/index.js 的写法：ctx.inject(["webServer"], host => host.effect(...))。
+  // 好处是 apply 不依赖 webServer 的时序：服务晚到也会挂上，卸载时 effect cleanup 一把全撤。
+  const routeDeps = (active) => ({
+    cfg: active,
+    getContext: resolver.resolve,
+    reindex: (lc) => core.ingest(lc, {
+      excludePaths: active.excludePaths, redact: active.redact,
+      episodes: active.episodeEnabled, episodeClosureMinutes: active.episodeClosureMinutes, episodeMaxChars: active.episodeMaxChars,
+    }),
+    log: (m) => console.log(m),
+    warn: (m) => console.warn(m),
+  });
+
   try {
-    const ws = ctx?.webServer ?? ctx?.get?.('webServer');
-    if (ws && typeof ws.register === 'function') {
-      disposeRoutes = registerPanelRoutes(ws, {
-        cfg,
-        getContext: resolver.resolve,
-        reindex: (lc) => core.ingest(lc, {
-          excludePaths: cfg.excludePaths, redact: cfg.redact,
-          episodes: cfg.episodeEnabled, episodeClosureMinutes: cfg.episodeClosureMinutes, episodeMaxChars: cfg.episodeMaxChars,
-        }),
-      });
+    if (typeof ctx?.inject !== 'function') {
+      console.error('[dsh-mem] ctx.inject 不可用，面板路由不注册（5 个工具照常）');
     } else {
-      console.warn('[dsh-mem] 宿主没有 webServer 服务，面板路由不注册（5 个工具照常）');
+      ctx.inject(['webServer'], (host) => {
+        host.effect(() => {
+          try {
+            const dispose = registerPanelRoutes(host.webServer, routeDeps(cfg));
+            console.log('[dsh-mem] panel routes registered: /dsh-mem/panel/*');
+            return () => { try { dispose(); } catch { /* ignore */ } };
+          } catch (e) {
+            // 路径重复 / 服务形态不对：打印原文，别只写一句"失败了"
+            console.error('[dsh-mem] panel routes: host.webServer.register failed:', e?.stack || e);
+            return () => {};
+          }
+        }, 'dsh-mem: panel routes');
+      });
     }
   } catch (e) {
-    console.warn('[dsh-mem] 面板路由注册失败（工具不受影响）:', e?.message || e);
+    console.error('[dsh-mem] panel routes: ctx.inject(["webServer"]) failed:', e?.stack || e);
   }
 
   return () => {
-    try { disposeRoutes?.(); } catch { /* ignore */ }
     for (const d of disposers) { try { d?.(); } catch { /* ignore */ } }
   };
 }

@@ -16,13 +16,19 @@ const TOOL_NAMES = ['mem_episodes', 'mem_ingest', 'mem_open', 'mem_search', 'mem
 
 function fakeCtx() {
   const registered = [];
-  const ctx = { tools: { register(def) { registered.push(def); return () => {}; } } };
-  return { ctx, registered };
+  const injected = [];
+  const ctx = {
+    tools: { register(def) { registered.push(def); return () => {}; } },
+    // webServer 走动态注入；这里只记名字、不触发（路由本身由 test/routes.test.mjs 覆盖）
+    inject(names, cb) { injected.push({ names, cb, fiber: true }); },
+  };
+  return { ctx, registered, injected };
 }
 
 test('插件元信息：name / inject / 默认导出都是 apply', () => {
   assert.equal(name, 'dsh-mem');
-  assert.deepEqual(inject, ['tools', 'webServer'], 'webServer 让面板的 5 条路由挂到 GUI 同一个 web 服务上');
+  // 静态 inject 只留 tools：webServer 是后挂服务，静态依赖会让 apply 等它 → 路由永远挂不上
+  assert.deepEqual(inject, ['tools'], 'webServer 必须走 ctx.inject 动态注入，不进静态 inject');
   assert.equal(typeof apply, 'function');
   assert.equal(applyDefault, apply, '默认导出必须是 apply（`import apply from "dsh-mem"` 直接用）');
   assert.deepEqual(Object.keys(DEFAULTS), ['workspace', 'storeDir', 'excludePaths', 'redact', 'autoIngest',
