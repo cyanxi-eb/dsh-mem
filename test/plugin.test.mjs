@@ -12,7 +12,7 @@ import applyDefault, { DEFAULTS, apply, inject, name, normalizeConfig, toolSpecs
 import * as core from '../lib/core.mjs';
 import { tmpHome } from '../support/helpers.mjs';
 
-const TOOL_NAMES = ['mem_ingest', 'mem_open', 'mem_search', 'mem_stats'];
+const TOOL_NAMES = ['mem_episodes', 'mem_ingest', 'mem_open', 'mem_search', 'mem_stats'];
 
 function fakeCtx() {
   const registered = [];
@@ -22,24 +22,29 @@ function fakeCtx() {
 
 test('插件元信息：name / inject / 默认导出都是 apply', () => {
   assert.equal(name, 'dsh-mem');
-  assert.deepEqual(inject, ['tools']);
+  assert.deepEqual(inject, ['tools', 'webServer'], 'webServer 让面板的 5 条路由挂到 GUI 同一个 web 服务上');
   assert.equal(typeof apply, 'function');
   assert.equal(applyDefault, apply, '默认导出必须是 apply（`import apply from "dsh-mem"` 直接用）');
-  assert.deepEqual(DEFAULTS, { workspace: '', storeDir: '', excludePaths: [], redact: [], autoIngest: false });
+  assert.deepEqual(Object.keys(DEFAULTS), ['workspace', 'storeDir', 'excludePaths', 'redact', 'autoIngest',
+    'rerank', 'rerankLexical', 'episodeEnabled', 'episodeClosureMinutes', 'episodeMaxChars',
+    'embeddingEnabled', 'embeddingModel', 'embeddingModelDir', 'embeddingFailFast'],
+  '配置键名逐字绑定面板，不许改名');
+  assert.equal(DEFAULTS.rerank, 'lexical', '0.2 词面重排默认开');
+  assert.equal(DEFAULTS.embeddingFailFast, true);
   assert.equal(normalizeConfig({}).storeDir, path.join(core.homeDir(), 'mem'), 'storeDir 缺省 = $DSH_HOME/mem');
   assert.equal(normalizeConfig({}).workspace, '', 'workspace 缺省 = 空（走优先级链）');
   assert.equal(normalizeConfig({ workspace: 'D:\\dsh-sp1' }).workspace, path.resolve('D:\\dsh-sp1'));
   assert.equal(normalizeConfig({ storeDir: 'D:\\x' }).storeDir, path.resolve('D:\\x'));
 });
 
-test('apply 注册 4 个工具，schema 形状符合宿主契约', async () => {
+test('apply 注册 5 个工具，schema 形状符合宿主契约', async () => {
   const home = tmpHome();
   const prev = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
   try {
     const { ctx, registered } = fakeCtx();
     const dispose = await apply(ctx, { storeDir: path.join(home, 'mem') });
-    assert.equal(registered.length, 4, '必须注册 4 个工具');
+    assert.equal(registered.length, 5, '必须注册 5 个工具');
     assert.deepEqual(registered.map((t) => t.name).sort(), TOOL_NAMES);
 
     for (const t of registered) {
@@ -59,6 +64,7 @@ test('apply 注册 4 个工具，schema 形状符合宿主契约', async () => {
     assert.equal(byName.mem_search.parameters.properties.query.type, 'string');
     assert.equal(byName.mem_open.parameters.properties.context.type, 'integer');
     assert.deepEqual(byName.mem_stats.parameters.properties, {});
+    assert.deepEqual(Object.keys(byName.mem_episodes.parameters.properties), ['session', 'limit']);
 
     assert.equal(typeof dispose, 'function');
     dispose();
@@ -118,11 +124,11 @@ test('配置透传：excludePaths / redact / autoIngest 进到工具里', async 
       redact: ['sk-[A-Za-z0-9]{20,}'],
       autoIngest: false,
     });
-    assert.equal(registered.length, 4);
+    assert.equal(registered.length, 5);
 
     const badCfg = fakeCtx();
     await apply(badCfg.ctx, { storeDir: path.join(home, 'mem'), redact: ['('] });
-    assert.equal(badCfg.registered.length, 4, '坏正则只告警，不阻断注册');
+    assert.equal(badCfg.registered.length, 5, '坏正则只告警，不阻断注册');
   } finally {
     if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
   }
@@ -180,7 +186,7 @@ test('工作区解析只有一份：钉死 workspace 后插件与 CLI 同库（�
   }
 });
 
-test('宿主真实 defineTool 能编译这 4 份 spec（有安装时；无则跳过）', async (t) => {
+test('宿主真实 defineTool 能编译这 5 份 spec（有安装时；无则跳过）', async (t) => {
   const candidates = [
     process.env.DSH_TOOLS_PATH,
     process.resourcesPath && path.join(process.resourcesPath, 'app', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
@@ -195,7 +201,7 @@ test('宿主真实 defineTool 能编译这 4 份 spec（有安装时；无则跳
 
   const cfg = normalizeConfig({ storeDir: path.join(tmpHome(), 'mem') });
   const specs = toolSpecs(cfg, {});
-  assert.equal(specs.length, 4);
+  assert.equal(specs.length, 5);
   for (const spec of specs) {
     const compiled = realDefineTool(spec);            // schema 不合宿主词汇表会在这里抛
     assert.equal(compiled.name, spec.name);

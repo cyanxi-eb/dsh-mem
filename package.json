@@ -6,8 +6,12 @@
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./client": "./lib/client.js",
     "./core": "./lib/core.mjs",
     "./portable": "./lib/portable.mjs",
+    "./embed": "./lib/embed.mjs",
+    "./panel-routes": "./lib/panel-routes.mjs",
+    "./settings-schema": "./lib/settings-schema.js",
     "./package.json": "./package.json"
   },
   "bin": {
@@ -16,6 +20,7 @@
   "files": [
     "bin/",
     "lib/",
+    "docs/",
     "skill/",
     "index.mjs",
     "cordis.patch.yml",
@@ -25,10 +30,21 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   },
   "engines": {
     "node": ">=22"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.3.2"
   },
   "scripts": {
     "test": "node --test",

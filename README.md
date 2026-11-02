@@ -4,9 +4,21 @@
 一个索引库（SQLite FTS5 trigram）从 DSH 自己的会话日志里派生出可复核的
 `<sessionId>#seq=<n>` 指针；外加 NDJSON 迁移与入库前隐私闸。
 
-- **DSH 插件**：`cordis.patch.yml` 一行插入，注册 `mem_search` / `mem_open` / `mem_ingest` / `mem_stats` 四个工具。
+- **DSH 插件**：`cordis.patch.yml` 一行插入，注册 `mem_search` / `mem_open` / `mem_ingest` / `mem_episodes` / `mem_stats` 五个工具。
 - **独立 CLI**：`dsh-mem <cmd>`，`node bin/dsh-mem.mjs <cmd>` 等价；吃纯文本不依赖 DSH。
 - 只 import `node:*`（含 `node:sqlite`），**没有任何第三方依赖**。
+
+## 三层（0.2）
+
+| 层 | 做什么 | 开关 | 判据（实测见下） |
+|---|---|---|---|
+| **P0 查询切分** | 整句中文 0 命中时切成相邻 bigram 再 OR；英文/路径整词保留。**先失败才切**，所以原本能命中的查询逐字节不变 | 常开（修 bug） | 12 条自然语言查询 R@3 0 → 0.333 |
+| **P1 事件层 `episode`** | 只存「区间 + 指纹」，**不存摘要文本**；摘要要就现算。幂等 pass 扫 `turn` 生成，已封区间永不修改 | `episodeEnabled` 等 | 覆盖 turn 100%，复跑新增 0 |
+| **P2 词面重排** | 字符 2+3gram TF-IDF 余弦，**只对 P0 的候选集重排**，不单独当入口 | `rerank` / `rerankLexical` | R@3 0.333 → 0.667（Δ=0.334） |
+
+- **P3 向量层只留门**：`embedding*` 四个键已经进 config 与 `normalizeConfig`，但 `lib/embed.mjs` 不接线；`rerank:'embedding'` 当前按 `off` 处理（缺模型不许假装有）。
+- `rerank` 的**缺省口径**：插件 config 默认 `'lexical'`；**CLI 默认 `'off'`**（CLI 没有配置文件，且要能跟冻结的老实现逐字节对账，`--rerank lexical` 显式打开）。
+
 
 ## 三条不变量
 
@@ -27,7 +39,7 @@ dsh plugin --profile <profile> add github:cyanxi-eb/dsh-mem
 实测（DSH 0.2.1-rc.5）：`EXIT=0`，5.7s，只下载 1 个 tarball，装到
 `<DSH_HOME>/profiles/<profile>/node_modules/dsh-mem`，package.json 的
 `dsh.profile.bundles` 自动多出 `dsh-mem`，`--dump-config` 里出现 insert 条目与四个配置默认值。
-**装完需重启 DSH**，4 个工具才会进工具表。
+**装完需重启 DSH**，5 个工具才会进工具表，面板挂到「设置 → 记忆库（dsh-mem）」（见下节）。
 
 > ⚠️ 前置：`dsh plugin` 会 spawn **裸 `pnpm`**。若 `pnpm` 不在 PATH 上，裸命令行会报
 > `'pnpm' is not recognized`。两条出路：把 pnpm 放进 PATH，或改用 GUI 的插件管理器
@@ -51,7 +63,21 @@ CLI 与插件共用 `lib/core.mjs` 这一份实现，行为一致。
 - insert:
     - id: dsh-mem
       name: 'dsh-mem'
-      config: { workspace: '', storeDir: '', excludePaths: [], redact: [], autoIngest: false }
+      config:
+        workspace: ''            # 钉死工作区；空 = 优先级链
+        storeDir: ''             # 库目录；空 = $DSH_HOME/mem
+        excludePaths: []         # 入库时跳过的路径 glob
+        redact: []               # 入库前替换的正则
+        autoIngest: false        # 首次工具调用时后台 ingest 一次
+        rerank: 'lexical'        # 'off' | 'lexical' | 'embedding'（向量 = RRF(词面,向量)，k=60）
+        rerankLexical: true
+        episodeEnabled: true
+        episodeClosureMinutes: 10
+        episodeMaxChars: 4000
+        embeddingEnabled: false
+        embeddingModel: 'bge-small-zh-v1.5'
+        embeddingModelDir: ''
+        embeddingFailFast: true
 ```
 
 - `workspace` — 钉死的工作区绝对路径（例如 `'D:\dsh-sp1'`）；空 = 按下面的优先级链自动解析。**解析只有 `core.resolveWorkspace` 一份实现，CLI 与插件共用**：`workspace` 配置 > 宿主会话 `cwd`（`exec.agent.session.header.cwd` / `workingDirectory.get(session)`，取不到就跳过）> `process.cwd()` > profile 目录（`DSH_PROFILE_DIR` / `<DSH_HOME>/profiles/<DSH_PROFILE>`）
@@ -60,19 +86,51 @@ CLI 与插件共用 `lib/core.mjs` 这一份实现，行为一致。
 - `redact` — 入库前替换的正则数组（见下节）
 - `autoIngest` — 默认 `false`：**不自动索引**，由你显式触发
 
-插件只 `inject: ['tools']`；宿主没就绪的其它服务一概不声明（少一项 inject，就少一种"永远加载中"）。
+0.2 新增的键（**逐字绑定面板**，改名会让面板写了不生效）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `rerank` | `'lexical'` | `'off'` 与 P0 逐字节一致 / `'lexical'` 词面重排 / `'embedding'` 向量重排（RRF(L3,向量) k=60；模型缺失时按 `embeddingFailFast` 报错或退回词面） |
+| `rerankLexical` | `true` | 词面重排的独立开关；`false` 等价于 `rerank:'off'` |
+| `episodeEnabled` | `true` | ingest 时幂等 pass 生成 episode 区间 |
+| `episodeClosureMinutes` | `10` | 闭合阈值：源文件 mtime 距今 ≥ N 分钟才算闭合 |
+| `episodeMaxChars` | `4000` | 单段字符上限；超了在 assistant 消息边界再切 |
+| `embeddingEnabled` | `false` | 向量层开关（默认关：要 90MB 模型 + 可选依赖） |
+| `embeddingModel` | `'bge-small-zh-v1.5'` | 模型 id（宿主按 `embed-models.MODELS` 白名单校验） |
+| `embeddingModelDir` | `''` | 模型根目录；空 = `$DSH_HOME/mem/models` |
+| `embeddingFailFast` | `true` | 模型不可用时显式失败（`false` = 静默退回词面重排，只 warn 一次） |
+
+默认值**只有一份**：`index.mjs` 的 `DEFAULTS`（`cordis.patch.yml` 与它逐键相等，`test/routes.test.mjs` ⑥ 看着）。
+`lib/settings-schema.js` 只留值域（`BOUNDS`）与消毒，不再持有默认值。
+
+### 设置面板（0.2）
+
+`dsh.client` 让 web 端加载 `lib/client.js`，面板落在「设置 → 记忆库（dsh-mem）」。
+它读写的 5 条路由由宿主半注册在 GUI 同一个 web 服务上（`docs/PANEL-CONTRACT.md` 是契约）：
+
+```
+GET  /dsh-mem/panel/state               只读：库健康数 + 当前 9 键 config + 能力探测
+PUT  /dsh-mem/panel/settings            {patch:{…}} → 消毒后原子写 $DSH_HOME/mem/panel-config.json
+POST /dsh-mem/panel/models/download     启动模型下载，返回 jobId（同一时刻只允许一个）
+GET  /dsh-mem/panel/models/download?jobId=…  轮询进度
+POST /dsh-mem/panel/reindex             增量 ingest + episode pass
+```
+
+插件 `inject: ['tools', 'webServer']`：宿主没有 webServer 服务就不挂面板（5 个工具照旧）。
 
 ## 命令（CLI）
 
 ```bash
-dsh-mem ingest [--all] [--dry-run] [--json]          # 增量入库本工作区会话；--all 忽略水位全量重扫
+dsh-mem ingest [--all] [--dry-run] [--no-episodes] [--json]  # 增量入库本工作区会话；--all 忽略水位全量重扫
 dsh-mem ingest --file <path> [--source <name>]       # 吃 .md/.txt/.jsonl，按段落切块入库
-dsh-mem search "Router Worker 分工" --k 8 [--json]   # 每条: score  sessionId#seq  [user|asst]  原文≤120字
+dsh-mem search "Router Worker 分工" --k 8 [--rerank lexical] [--json]   # 每条: score  sessionId#seq  [user|asst]  原文≤120字
 dsh-mem open "07f38d2c-...-#seq=293" --context 2     # 按指针取回原文，可带前后各 N 轮
+dsh-mem open "07f38d2c-...#293-441"                  # 按 episode 区间取回该区间全部原文（不摘要）
+dsh-mem episodes [--rebuild] [--json]                # 列情景区间：session / 区间 / 是否封 / 段数
 dsh-mem stats [--json]                               # 会话数 / 轮次 / 库大小 / 水位
 dsh-mem export --out dump.ndjson [--json]            # 导出：首行 header + 一行一个 turn
 dsh-mem import dump.ndjson [--dry-run] [--json]      # 导入：校验 schema、幂等
-dsh-mem selftest                                     # 14 项自检（临时库，不碰真库）
+dsh-mem selftest                                     # 自检（临时库，不碰真库）
 ```
 
 全局旗标：`--workspace <path>`、`--home <dir>`（缺省 `$DSH_HOME` 再缺省 `~/.dsh`）、
@@ -86,9 +144,13 @@ dsh-mem selftest                                     # 14 项自检（临时库�
 | 工具 | 参数 | 返回 |
 |---|---|---|
 | `mem_search` | `query`（必填）、`k` | `{query,k,hits,mode,results:[{pointer,session,seq,role,ts,score,promoted,snippet}]}` |
-| `mem_open` | `pointer`（必填）、`context` | `{anchor,session,rows:[{id,seq,role,ts,text}],anchorId}` |
+| `mem_open` | `pointer`（必填）、`context` | `{anchor,session,rows:[{id,seq,role,ts,text}],anchorId}`；指针是区间时按区间回原文 |
 | `mem_ingest` | `file?`、`source?`、`dryRun?` | ingest 统计（无 `file` = 重扫本工作区会话） |
+| `mem_episodes` | `session?`、`limit?` | `{count,sealed,open,turnsCovered,episodes:[{session,startSeq,endSeq,seal,genVersion,turns,chars,pointer}]}` |
 | `mem_stats` | 无 | 库路径/大小、会话数、轮次、fact 计数、水位 |
+
+`mode` 的取值：`AND` / `OR` / `LIKE` / `AND+LIKE` / `split`（P0 切分回落后命中）。
+`episode` 是**派生索引**：它只给区间，证据永远是 `open` 出来的原文（I3 红线）。
 
 工作区由 `core.resolveWorkspace` 按固定优先级解析（配置 `workspace` → 宿主会话 `cwd` → `process.cwd()` → profile 目录），CLI 走同一个函数；一工作区一库，按 `<hash8>-<目录名>.db` 分片。
 
@@ -132,25 +194,34 @@ dsh-mem import mem.ndjson            # UNIQUE(session,seq) + INSERT OR IGNORE �
 ## 已知边界
 
 - **跨工作区不检索**：一工作区一库。要合并请 `export/import` 到同一库（`session` 指针不冲突）。
-- **无语义/同义词**：纯子串 trigram；换个说法就不命中。`NEAR` 在 trigram 下失效，多词只能 AND（空则 OR）。
+- **无语义/同义词**：P0 只是把整句切成 bigram 再 OR（召回），P2 只是对候选集按 2+3gram TF-IDF 重排；
+  **同义改写（"怎么修" vs "如何修复"）仍然不命中**——那是 P3 的活，现在没接线。
+- **P0 的切分是"兜底"不是"主路径"**：整句/整词能命中就绝不切（这也是等价性测试能守住的原因）；
+  代价是多词自然语言查询若 OR 先命中了几条，就不会再切分召回。
+- **P2 的 IDF 取自全库**，进程内按 `turn` 总数缓存；语料变了自动重建（首查 ~70 ms，热查 ~18 ms @266 轮）。
+  重排模式下 `promoted` 退成次级键——否则 68 条 fact anchor 会把候选全压在 cosine 之上，重排等于没做。
+- **`episode` 只对 DSH 会话生效**：`file:` / `ndjson import` 进来的会话没有事件流，无法判定 `turn/end`，
+  一律不切（`build` 计数里记 `noSource`）。`episode` 不存摘要，读完区间要摘要请自己算。
 - **`fact` 表不导出**：它只是"命中即加权的排序提示"，导出字段只有 `turn` 那 7 个；导入后 `promoted` 全为 false，
   原库里被 fact 提权的顺序可能不同。`prune`（降权淘汰）仍未实现。
 - **`ingest --file` 的段落切分**：`.md/.txt` 按空行切、`.jsonl` 一行一条；`session = file:<source>@<内容hash8>`，
   文件改了就是一组新指针（守 I1，不覆盖旧原文）。
 - **dry-run 的"将入库"** 是"文件里还没有的 `(session,seq)`"；会话 ingest 的 dry-run 不读水位，按实际库比对。
+  dry-run **只读打开**（`readOnly`），不跑 DDL、不推 `user_version`——否则 episode 表一进 DDL，dry-run 就是一次 schema 迁移。
 - **Node 版本**：`node:sqlite` 在 Node 22 需要 `--experimental-sqlite`，24+ 直接可用。CI 跑 24/26。
 - **Windows 路径**：库名 `<hash8>-<目录名>.db` 的 hash 基于规范化后的工作区路径，换平台/换盘符就是另一个库。
 
-## 验证（本机实测，2026-11-01）
+## 验证（本机实测，2026-11-02 / 0.2）
 
 | 项 | 结果 |
 |---|---|
-| `node --test` | 25 通过 / 0 失败 |
-| `selftest` | 14 项全绿 |
-| 等价性（真实库副本 266 轮 / 19 会话） | 5 条查询 + open + stats 逐字节一致 |
-| 插件加载 | 4 个工具注册成功，宿主真实 `defineTool` 编译通过 |
-| round-trip | export → 删库 → import：轮次一致，search 前 3 条逐字段一致 |
-| 单查 | 3–5 ms（266 轮，1.3 MB 库） |
+| `node --test` | 全绿（0 失败）；本层新增 12 条 = P0/P2 判据 6 条 + P1/dry-run 判据 6 条 |
+| P0（12 条自然语言查询，真实库副本 266 轮） | R@3 **0.000 → 0.333**（要求 ≥0.30） |
+| P2（同一批查询） | R@3 **0.333 → 0.667**（Δ=0.334，要求 ≥0.15）；`rerank:'off'` 与 P0 逐字节一致 |
+| P1（真实库副本 ingest） | 50 段 / 44 封印 / 6 开放，覆盖 266/266 turn；复跑新增 0 |
+| dry-run | 老库副本跑完 mtime/大小不变，`episode` 表没被建出来，`user_version` 仍是 0 |
+| 真库只读 | `53fe3fff-dsh-sp1.db` 只读打开可读全部旧数据；迁移在 %TEMP% 副本上做，`turn` 266 行不变 |
+| 等价性（真实库副本） | 5 条查询 + open + stats 与冻结老实现逐字节一致 |
 
 ## License
 

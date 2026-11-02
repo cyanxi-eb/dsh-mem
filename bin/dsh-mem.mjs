@@ -12,10 +12,12 @@ import * as portable from '../lib/portable.mjs';
 
 const USAGE = `dsh-mem — 零依赖本地记忆层（真相源=sessions/*.zstd，库=纯派生索引）
 
-  dsh-mem ingest [--all] [--dry-run] [--json]                增量入库（默认全部会话；--all 忽略水位全量重扫）
+  dsh-mem ingest [--all] [--dry-run] [--no-episodes] [--json] 增量入库（默认全部会话；--all 忽略水位全量重扫）
   dsh-mem ingest --file <path> [--source <name>] [--dry-run]  吃 .md/.txt/.jsonl，按段落切块入库
-  dsh-mem search <query> [--k 8] [--json]                    回指针 + 原文切片
+  dsh-mem search <query> [--k 8] [--rerank off|lexical] [--json]  回指针 + 原文切片
   dsh-mem open <sessionId#seq> [--context 2] [--json]        按指针取回原文（可带前后各 N 轮）
+  dsh-mem open <sessionId#start-end> [--json]                按 episode 区间取回该区间全部原文
+  dsh-mem episodes [--rebuild] [--json]                      列情景区间（session/区间/是否封/段数）
   dsh-mem stats [--json]                                     会话数/轮次/库大小/水位
   dsh-mem export --out <file.ndjson> [--json]                导出一行一个 turn（首行 header）
   dsh-mem import <file.ndjson> [--dry-run] [--json]          导入（校验 schema，幂等）
@@ -26,8 +28,8 @@ const USAGE = `dsh-mem — 零依赖本地记忆层（真相源=sessions/*.zstd�
         --home 缺省读环境变量 DSH_HOME，再缺省 ~/.dsh；--store-dir 缺省 <home>/mem
 `;
 
-const FLAGS = new Set(['all', 'json', 'help', 'dry-run']);
-const VALUED = new Set(['workspace', 'home', 'store-dir', 'k', 'context', 'source', 'out', 'file', 'exclude', 'redact']);
+const FLAGS = new Set(['all', 'json', 'help', 'dry-run', 'no-episodes', 'rebuild']);
+const VALUED = new Set(['workspace', 'home', 'store-dir', 'k', 'context', 'source', 'out', 'file', 'exclude', 'redact', 'rerank']);
 
 export function parseArgs(argv) {
   const flags = new Set();
@@ -90,6 +92,7 @@ function main(argv) {
     }
     const r = core.ingest(ctx, {
       all: flags.has('all'), dryRun: flags.has('dry-run'),
+      episodes: !flags.has('no-episodes'),
       excludePaths: ctx.excludePaths, redact: ctx.redact,
       log: json ? () => {} : (s) => console.log(s),
     });
@@ -105,6 +108,10 @@ function main(argv) {
       + `  excluded ${r.excluded}  busy-skipped ${r.busySkips}  尾帧不完整 ${r.partial}`);
     console.log(`[ingest] 本次新增 turn ${r.turns}  facts ${r.facts}  redact ${r.redacted}  坏 JSON ${r.badJson}`
       + `  丢弃注入 ${r.dropped}  解压 ${(r.decodedBytes / 1048576).toFixed(2)} MB`);
+    if (r.episodes) {
+      console.log(`[ingest] episode 段 ${r.episodes.segments}  新建 ${r.episodes.created}  作废旧开区间 ${r.episodes.removed}`
+        + `  封印 ${r.episodes.sealed}  闭合 ${r.episodes.closed}/${r.episodes.sessions} 会话  ${r.episodes.ms} ms`);
+    }
     console.log(`[ingest] 库内合计 turn ${r.turnsTotal} (user ${r.user} / asst ${r.asst})  `
       + `db ${(r.dbBytes / 1048576).toFixed(2)} MB  ${r.ms} ms  ${r.dbPath}`);
     return 0;
@@ -112,21 +119,51 @@ function main(argv) {
 
   if (cmd === 'search') {
     if (!pos[1]) throw new core.AppError('缺 <query>', 1);
+    const rerank = opts.rerank ?? 'off';   // CLI 缺省 off：与冻结的老实现逐字节可比（插件那条路默认 lexical）
+    if (!['off', 'lexical', 'embedding'].includes(rerank)) throw new core.AppError(`--rerank 只吃 off|lexical|embedding`, 1);
     const db = core.openDb(ctx.dbp);
     try {
-      const r = core.search(db, pos[1], Number(opts.k ?? 8));
+      const r = core.search(db, pos[1], Number(opts.k ?? 8), { rerank });
       if (json) { console.log(JSON.stringify(r, null, 1)); return 0; }
       for (const x of r.results)
         console.log(`${String(x.score).padEnd(10)} ${x.pointer}  [${x.role}]  ${x.snippet}`);
-      console.log(`\n命中 ${r.hits} 条 / 用时 ${r.ms} ms   (mode=${r.mode}, k=${r.k})`);
+      console.log(`\n命中 ${r.hits} 条 / 用时 ${r.ms} ms   (mode=${r.mode}, k=${r.k}, rerank=${rerank})`);
+      return 0;
+    } finally { db.close(); }
+  }
+
+  if (cmd === 'episodes') {
+    const db = core.openDb(ctx.dbp);
+    try {
+      const build = core.buildEpisodes(db, ctx, {
+        all: flags.has('rebuild'), log: json ? () => {} : (s) => console.log(s),
+      });
+      const r = core.listEpisodes(db, { limit: 500 });
+      if (json) { console.log(JSON.stringify({ ...r, build }, null, 1)); return 0; }
+      console.log(`[episodes] ${r.count} 段（封印 ${r.sealed} / 开放 ${r.open}）  覆盖 turn ${r.turnsCovered}`);
+      for (const e of r.episodes)
+        console.log(`${e.seal ? 'sealed' : 'open  '}  ${e.pointer}  turns=${e.turns} chars=${e.chars}  gen=${e.genVersion}`);
+      console.log(`[episodes] build: 新建 ${build.created} 作废 ${build.removed} 封印 ${build.sealed}`
+        + `  partialTail 跳过 ${build.skippedPartial} 无源日志 ${build.noSource}  ${build.ms} ms`);
       return 0;
     } finally { db.close(); }
   }
 
   if (cmd === 'open') {
-    if (!pos[1]) throw new core.AppError('缺 <sessionId#seq>', 1);
+    if (!pos[1]) throw new core.AppError('缺 <sessionId#seq> 或 <sessionId#start-end>', 1);
     const db = core.openDb(ctx.dbp);
     try {
+      if (core.parseEpisodePointer(pos[1])) {              // 区间指针 → 回该区间全部原文
+        const r = core.openEpisode(db, pos[1]);
+        if (json) { console.log(JSON.stringify(r, null, 1)); return 0; }
+        console.log(`[区间] ${r.anchor}  共 ${r.rows.length} 条原文（未摘要）`);
+        for (const row of r.rows) {
+          console.log(`--- ${r.session}#seq=${row.seq}  [${row.role}]`);
+          console.log(row.text);
+          console.log('');
+        }
+        return 0;
+      }
       const r = core.openPointer(db, pos[1], Number(opts.context ?? 2));
       if (json) { console.log(JSON.stringify(r, null, 1)); return 0; }
       r.rows.forEach((row, i) => {

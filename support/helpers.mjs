@@ -26,6 +26,41 @@ export function addSession(home, ws, sid, records) {
   fs.writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), zlib.zstdCompressSync(lines(records)));
 }
 
+// ── 事件层夹具：带事件流 + 可控 mtime 的会话日志 ─────────────────────────
+export const ev = (type, seq, time = 1000 + seq) => ({ type, seq, time, data: {} });
+
+/** 一个"完整 turn"：turn/start → user/message → assistant/message → step/end → turn/end。 */
+export function turnBlock(base, userText, asstText, time = 1000 + base) {
+  return [
+    ev('turn/start', base, time),
+    userTurn(base + 1, userText, time + 1),
+    asstTurn(base + 2, asstText, time + 2),
+    ev('step/end', base + 3, time + 3),
+    ev('turn/end', base + 4, time + 4),
+  ];
+}
+
+/** 写会话日志并钉死 mtime（闭合判据要看"距今多久"）。返回文件路径。 */
+export function writeSession(home, ws, sid, records, { mtime } = {}) {
+  const dir = path.join(home, 'sessions', core.sessionDirName(ws), sid);
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, 'session.v4.jsonl.zstd');
+  fs.writeFileSync(f, Buffer.isBuffer(records) ? records : zlib.zstdCompressSync(lines(records)));
+  if (mtime) fs.utimesSync(f, new Date(mtime), new Date(mtime));
+  return f;
+}
+
+/** 往已有会话日志尾部追加一帧（模拟会话续写）。 */
+export function appendSession(file, records) {
+  fs.appendFileSync(file, zlib.zstdCompressSync(lines(records)));
+}
+
+/** 完好帧 + 半截尾帧：decodeZstd(allowPartialTail) 会打 partialTail=true。 */
+export function withPartialTail(records) {
+  const half = zlib.zstdCompressSync(Buffer.from('{"type":"turn/end","seq":9999}\n')).subarray(0, 8);
+  return Buffer.concat([zlib.zstdCompressSync(lines(records)), half]);
+}
+
 export const cliPath = () => path.join(ROOT, 'bin', 'dsh-mem.mjs');
 
 /** 跑 CLI 并返回 stdout（非 0 退出会抛）。 */

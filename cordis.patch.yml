@@ -13,3 +13,20 @@
         redact: []
         # 首次工具调用时按当前工作区后台 ingest 一次
         autoIngest: false
+        # ── 0.2 三层：重排 / 事件层 / 向量层（键名逐字绑定面板，不许改名） ──
+        # 重排模式：'off' 与 P0 逐字节一致 | 'lexical' 词面 2+3gram TF-IDF 余弦 | 'embedding' 仅留接口位
+        rerank: 'lexical'
+        # 词面重排的独立开关（配合 rerank:'lexical'）
+        rerankLexical: true
+        # 事件层：ingest 时幂等 pass 扫 turn 生成 episode 区间（只存区间，不存摘要）
+        episodeEnabled: true
+        # 闭合阈值：源文件 mtime 距今 ≥ 这么多分钟才算闭合，闭合即封印，已封区间永不修改
+        episodeClosureMinutes: 10
+        # 单段字符上限；超了在 assistant 消息边界再切，绝不劈开一条消息
+        episodeMaxChars: 4000
+        # 向量层（P3 门槛制，现在默认关；未接线，改 true 也不会启用）
+        embeddingEnabled: false
+        embeddingModel: 'bge-small-zh-v1.5'
+        embeddingModelDir: ''
+        # 模型不可用时显式失败，绝不写零向量
+        embeddingFailFast: true

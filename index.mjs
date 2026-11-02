@@ -1,8 +1,8 @@
 /**
  * dsh-mem — 宿主半（Cordis 插件入口）。
  *
- * 只注册 4 个工具，全部转调 lib/core.mjs 与 lib/portable.mjs；这里没有第二份实现。
- * 契约照已装插件抄：`inject = ['tools']` + `ctx.tools.register(defineTool({...}))`，
+ * 只注册 5 个工具，全部转调 lib/core.mjs 与 lib/portable.mjs；这里没有第二份实现。
+ * 契约照已装插件抄：`inject = ['tools', 'webServer']` + `ctx.tools.register(defineTool({...}))`，
  * defineTool 优先从宿主的 @deepseek-ai/dsh-tools 解析，解析不到时用本文件的等价编译兜底
  * （参数规格只用到 string/integer/boolean 三种，编译规则与宿主 parameterSchemaSpecToJsonSchema 一致）。
  *
@@ -12,22 +12,51 @@
  *   excludePaths 入库时跳过的会话/文件路径 glob 数组，缺省 []
  *   redact       入库前替换的正则字符串数组，缺省 []（命中替换为 [redacted]）
  *   autoIngest   首次工具调用时后台 ingest 一次，缺省 false
+ *   rerank       'off' | 'lexical' | 'embedding'（embedding = RRF(词面, 向量)，k=60，见 core.searchEmbedding）
+ *   rerankLexical 词面重排的独立开关（配合 rerank:'lexical'），缺省 true
+ *   episodeEnabled / episodeClosureMinutes / episodeMaxChars  事件层（P1）
+ *   embeddingEnabled / embeddingModel / embeddingModelDir / embeddingFailFast  向量层（P3）
+ *
+ * 默认值唯一来源就是下面的 DEFAULTS（lib/settings-schema.js 只留值域，不再留默认值）。
+ * 面板落盘值 $DSH_HOME/mem/panel-config.json 在 apply 时叠在 loader config 之上。
  */
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as core from './lib/core.mjs';
 import * as portable from './lib/portable.mjs';
+import * as embed from './lib/embed.mjs';
+import * as embedModels from './lib/embed-models.mjs';
+import { RERANK_MODES } from './lib/settings-schema.js';
+import { readPanelConfig, registerPanelRoutes } from './lib/panel-routes.mjs';
 
 export const name = 'dsh-mem';
-export const inject = ['tools'];
+// webServer 让面板的 5 条路由挂到 GUI 同一个 web 服务上；宿主没这个服务就不挂面板（工具照旧）。
+export const inject = ['tools', 'webServer'];
 
-/** 与 cordis.patch.yml 的 config 同源；改这里要同步改那里。 */
+/** 与 cordis.patch.yml 的 config 同源；改这里要同步改那里（键名逐字绑定，面板按这些 key 写）。 */
 export const DEFAULTS = {
   workspace: '',
   storeDir: '',
   excludePaths: [],
   redact: [],
   autoIngest: false,
+  rerank: 'lexical',
+  rerankLexical: true,
+  episodeEnabled: true,
+  episodeClosureMinutes: 10,
+  episodeMaxChars: 4000,
+  embeddingEnabled: false,
+  embeddingModel: 'bge-small-zh-v1.5',
+  embeddingModelDir: '',
+  embeddingFailFast: true,
+};
+
+export { RERANK_MODES };                    // 老导出面保持可用（真源已搬到 lib/settings-schema.js）
+
+const intIn = (v, def, min, max) => {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, Math.round(n)));
 };
 
 const OUTPUT = {
@@ -89,6 +118,16 @@ export function normalizeConfig(config = {}) {
     excludePaths: Array.isArray(config.excludePaths) ? config.excludePaths : [],
     redact: Array.isArray(config.redact) ? config.redact : [],
     autoIngest: config.autoIngest === true,
+    rerank: RERANK_MODES.includes(config.rerank) ? config.rerank : DEFAULTS.rerank,
+    rerankLexical: config.rerankLexical !== false,
+    episodeEnabled: config.episodeEnabled !== false,
+    episodeClosureMinutes: intIn(config.episodeClosureMinutes, DEFAULTS.episodeClosureMinutes, 1, 1440),
+    episodeMaxChars: intIn(config.episodeMaxChars, DEFAULTS.episodeMaxChars, 200, 20000),
+    embeddingEnabled: config.embeddingEnabled === true,
+    embeddingModel: typeof config.embeddingModel === 'string' && config.embeddingModel.trim()
+      ? config.embeddingModel.trim().slice(0, 120) : DEFAULTS.embeddingModel,
+    embeddingModelDir: typeof config.embeddingModelDir === 'string' ? config.embeddingModelDir.trim().slice(0, 512) : '',
+    embeddingFailFast: config.embeddingFailFast !== false,
   };
 }
 
@@ -109,10 +148,73 @@ function hostWorkspaces(ctx, exec) {
   return out;
 }
 
-function libContext(ctx, cfg, exec) {
+function libContext(ctx, cfg, exec, resolver) {
   const home = core.homeDir();
   const ws = core.resolveWorkspace({ workspace: cfg.workspace, host: hostWorkspaces(ctx, exec), home });
+  resolver?.note?.(ws);
   return { home, ws, dbp: core.dbPathOf(home, ws, cfg.storeDir), cfg };
+}
+
+/** 面板路由没有会话上下文，只能记住"最近一次工具调用用的工作区"；一次都没调过才按 CLI 口径解析。 */
+function makeContextResolver(cfg) {
+  let lastWs = '';
+  return {
+    note(ws) { if (ws) lastWs = ws; },
+    resolve() {
+      const home = core.homeDir();
+      const ws = lastWs || core.resolveWorkspace({ workspace: cfg.workspace, host: [], home });
+      return { home, ws, dbp: core.dbPathOf(home, ws, cfg.storeDir), cfg };
+    },
+  };
+}
+
+// ───────────────────────── 检索（含 embedding 重排） ─────────────────────────
+let degradedWarned = false;
+
+/** 测试用：把"只 warn 一次"的闸门复位。 */
+export function resetEmbeddingWarning() { degradedWarned = false; }
+
+/** 向量层为什么用不了（'' = 能用）。原因要能直接贴给用户看。 */
+async function embeddingBlocked(cfg) {
+  if (cfg.embeddingEnabled !== true) return 'embeddingEnabled=false（向量层没打开）';
+  if (!(await embed.isAvailable(cfg))) return '没有装可选依赖 @huggingface/transformers';
+  const state = embedModels.modelState(cfg);
+  if (!state.ok) return `模型没就位（${state.reason}）: ${state.dir}`;
+  return '';
+}
+
+/**
+ * mem_search 的唯一入口：rerank='embedding' 走 RRF(词面, 向量)，其余两条路原样转 core.search。
+ *
+ * 向量不可用时的口径（用户已定）：embeddingFailFast !== false → 结构化报错（exitCode 4）；
+ * false → 静默退回词面重排，只 warn 一次。绝不点半截、绝不写零向量。
+ */
+export async function runSearch(db, query, k, cfg) {
+  if (cfg.rerank !== 'embedding') {
+    return core.search(db, query, k, { rerank: cfg.rerank, rerankLexical: cfg.rerankLexical });
+  }
+  const degrade = (reason) => {
+    if (cfg.embeddingFailFast !== false) throw new core.AppError(`向量检索不可用：${reason}`, 4);
+    if (!degradedWarned) {
+      degradedWarned = true;
+      console.warn(`[dsh-mem] 向量检索不可用（embeddingFailFast=false，退回词面重排）: ${reason}`);
+    }
+    return core.search(db, query, k, {
+      rerank: cfg.rerankLexical ? 'lexical' : 'off', rerankLexical: cfg.rerankLexical,
+    });
+  };
+  const why = await embeddingBlocked(cfg);
+  if (why) return degrade(why);
+  try {
+    return await core.searchEmbedding(db, query, k, {
+      rerankLexical: cfg.rerankLexical,
+      // bge 官方查询指令前缀**不加**：30 条实测 0.400/0.256 vs 裸查询 0.567/0.333（_embed-eval/eval-out.json）
+      embedFn: (texts) => embed.embedBatch(texts, { ...cfg, embeddingEnabled: true }),
+    });
+  } catch (e) {
+    if (e instanceof embedModels.EmbedError || e instanceof core.AppError) return degrade(`${e.code || ''} ${e.message}`.trim());
+    throw e;
+  }
 }
 
 /** AppError → 结构化工具结果（模型能看到原因），其他异常照抛。 */
@@ -125,7 +227,7 @@ async function guard(fn) {
 }
 
 // ───────────────────────────── 工具 ─────────────────────────────
-export function toolSpecs(cfg, ctx) {
+export function toolSpecs(cfg, ctx, resolver = null) {
   /**
    * autoIngest：第一次工具调用时按当前工作区后台 ingest 一次；不阻塞本次调用。
    * （apply 时刻还没有会话 cwd，所以只能懒到第一次调用。）
@@ -159,11 +261,12 @@ export function toolSpecs(cfg, ctx) {
       output: OUTPUT,
       async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg, exec);
+          const lc = libContext(ctx, cfg, exec, resolver);
           kickAutoIngest(lc);
           const db = core.openDb(lc.dbp);
-          try { return core.search(db, String(args.query ?? ''), Number(args.k ?? 8)); }
-          finally { db.close(); }
+          try {
+            return await runSearch(db, String(args.query ?? ''), Number(args.k ?? 8), cfg);
+          } finally { db.close(); }
         });
       },
     },
@@ -174,15 +277,19 @@ export function toolSpecs(cfg, ctx) {
         'Pass context>0 to also read the surrounding turns of the same session.',
       ].join('\n'),
       parameters: {
-        pointer: { type: 'string', required: true, description: '`<sessionId>#seq=<n>` (also accepts `<sessionId>#<n>`).' },
+        pointer: { type: 'string', required: true, description: '`<sessionId>#seq=<n>` (also accepts `<sessionId>#<n>`), or an episode range `<sessionId>#<start>-<end>`.' },
         context: { type: 'integer', description: 'Turns before and after the anchor, default 2.' },
       },
       output: OUTPUT,
       async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg, exec);
+          const lc = libContext(ctx, cfg, exec, resolver);
           const db = core.openDb(lc.dbp);
           try {
+            if (core.parseEpisodePointer(args.pointer)) {      // 区间指针：整段原文，不做上下文扩展
+              const r = core.openEpisode(db, String(args.pointer));
+              return { ...r, rows: r.rows.map(({ id, seq, role, ts, text }) => ({ id, seq, role, ts, text })) };
+            }
             const r = core.openPointer(db, String(args.pointer ?? ''), Number(args.context ?? 2));
             return { ...r, rows: r.rows.map(({ id, seq, role, ts, text }) => ({ id, seq, role, ts, text })) };
           } finally { db.close(); }
@@ -204,14 +311,42 @@ export function toolSpecs(cfg, ctx) {
       output: OUTPUT,
       async execute(args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg, exec);
+          const lc = libContext(ctx, cfg, exec, resolver);
           if (args.file) {
             return portable.ingestFile(lc.dbp, String(args.file), {
               source: args.source ? String(args.source) : '', dryRun: args.dryRun === true,
               redact: cfg.redact, excludePaths: cfg.excludePaths,
             });
           }
-          return core.ingest(lc, { dryRun: args.dryRun === true, excludePaths: cfg.excludePaths, redact: cfg.redact });
+          return core.ingest(lc, {
+            dryRun: args.dryRun === true, excludePaths: cfg.excludePaths, redact: cfg.redact,
+            episodes: cfg.episodeEnabled, episodeClosureMinutes: cfg.episodeClosureMinutes, episodeMaxChars: cfg.episodeMaxChars,
+          });
+        });
+      },
+    },
+    {
+      name: 'mem_episodes',
+      description: [
+        'List episodic ranges (存的是区间，不是摘要): session / start-end / sealed / covered turns.',
+        'Use a returned pointer `<sessionId>#<start>-<end>` with mem_open to read that range verbatim.',
+        'An episode is a DERIVED index — the evidence is still the original turns mem_open returns.',
+      ].join('\n'),
+      parameters: {
+        session: { type: 'string', description: 'Only this sessionId.' },
+        limit: { type: 'integer', description: 'Max episodes, default 50.' },
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        return guard(async () => {
+          const lc = libContext(ctx, cfg, exec, resolver);
+          const db = core.openDb(lc.dbp);
+          try {
+            return core.listEpisodes(db, {
+              session: args.session ? String(args.session) : '',
+              limit: Number(args.limit ?? 50),
+            });
+          } finally { db.close(); }
         });
       },
     },
@@ -222,7 +357,7 @@ export function toolSpecs(cfg, ctx) {
       output: OUTPUT,
       async execute(_args, exec) {
         return guard(async () => {
-          const lc = libContext(ctx, cfg, exec);
+          const lc = libContext(ctx, cfg, exec, resolver);
           const db = core.openDb(lc.dbp);
           try { return core.stats(db, lc.dbp); } finally { db.close(); }
         });
@@ -233,12 +368,20 @@ export function toolSpecs(cfg, ctx) {
 
 // ───────────────────────────── 入口 ─────────────────────────────
 export async function apply(ctx, config) {
-  const cfg = normalizeConfig(config ?? {});
+  const home = core.homeDir();
+  const base = normalizeConfig(config ?? {});
+  // 面板落盘值叠在 loader config 之上（面板是唯一写路径；不去改 profile 里的 cordis.patch.yml，
+  // 那是安装产物，重装即回滚）。坏文件/脏值由 DEFAULTS 收束，绝不让 boot 跟着炸。
+  let cfg = base;
+  try { cfg = { ...base, ...readPanelConfig(home, base, { warn: (m) => console.warn(m) }) }; }
+  catch (e) { console.warn('[dsh-mem] panel-config 读不了，按 loader config 走:', e?.message || e); }
+
   try { core.compileRedact(cfg.redact); }                       // 坏正则在这里就炸，不要等到入库
   catch (e) { console.warn('[dsh-mem] config.redact 无效，按空处理:', e?.message || e); cfg.redact = []; }
 
   const defineTool = await loadDefineTool();
-  const tools = toolSpecs(cfg, ctx).map((spec) => defineTool(spec));
+  const resolver = makeContextResolver(cfg);
+  const tools = toolSpecs(cfg, ctx, resolver).map((spec) => defineTool(spec));
 
   let register = null;
   try { if (typeof ctx?.tools?.register === 'function') register = (tool) => ctx.tools.register(tool); } catch { /* 未 inject 时 cordis 代理抛 */ }
@@ -248,7 +391,29 @@ export async function apply(ctx, config) {
   if (!register) throw new Error('dsh-mem: 宿主没有 tools 服务（inject 未生效？）');
 
   const disposers = tools.map((tool) => register(tool));
+
+  // 面板路由：宿主没有 webServer 服务就跳过（工具照常，面板降级成"读取失败"文案）
+  let disposeRoutes = null;
+  try {
+    const ws = ctx?.webServer ?? ctx?.get?.('webServer');
+    if (ws && typeof ws.register === 'function') {
+      disposeRoutes = registerPanelRoutes(ws, {
+        cfg,
+        getContext: resolver.resolve,
+        reindex: (lc) => core.ingest(lc, {
+          excludePaths: cfg.excludePaths, redact: cfg.redact,
+          episodes: cfg.episodeEnabled, episodeClosureMinutes: cfg.episodeClosureMinutes, episodeMaxChars: cfg.episodeMaxChars,
+        }),
+      });
+    } else {
+      console.warn('[dsh-mem] 宿主没有 webServer 服务，面板路由不注册（5 个工具照常）');
+    }
+  } catch (e) {
+    console.warn('[dsh-mem] 面板路由注册失败（工具不受影响）:', e?.message || e);
+  }
+
   return () => {
+    try { disposeRoutes?.(); } catch { /* ignore */ }
     for (const d of disposers) { try { d?.(); } catch { /* ignore */ } }
   };
 }
